@@ -56,8 +56,9 @@ public class UserController(IUserService service) : ControllerBase
     
     [HttpPost("RegisterUser")]
     public async Task<IActionResult> RegisterUser(UserRegisterModel user)
-    {
-        var result = await _userService.RegisterUser(user);
+    {      
+        var result = null ;
+        result = await _userService.RegisterUser(user);
         if (result)
         {
             return Ok(new Response
@@ -65,7 +66,7 @@ public class UserController(IUserService service) : ControllerBase
                 statuscode = 201,
                 message = "User registered successfully",
                 error_status = false,
-                data = null
+                data = "Hello"
             });
         }
         else
@@ -75,7 +76,7 @@ public class UserController(IUserService service) : ControllerBase
                 statuscode = 400,
                 message = "User registration failed",
                 error_status = true,
-                data = null
+                data ="Hello"
             });
         }
     }
