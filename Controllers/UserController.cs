@@ -57,28 +57,34 @@ public class UserController(IUserService service) : ControllerBase
     [HttpPost("RegisterUser")]
     public async Task<IActionResult> RegisterUser(UserRegisterModel user)
     {      
-        var result = null ;
-        result = await _userService.RegisterUser(user);
-        if (result)
-        {
-            return Ok(new Response
-            {
-                statuscode = 201,
-                message = "User registered successfully",
-                error_status = false,
-                data = "Hello"
-            });
-        }
-        else
-        {
-            return Ok(new Response
+        // var result = await _userService.RegisterUser(user);
+        // if (result)
+        // {
+        //     return Ok(new Response
+        //     {
+        //         statuscode = 201,
+        //         message = "User registered successfully",
+        //         error_status = false,
+        //         data = "Hello"
+        //     });
+        // }
+        // else
+        // {
+        //     return Ok(new Response
+        //     {
+        //         statuscode = 400,
+        //         message = "User registration failed",
+        //         error_status = true,
+        //         data ="Hello"
+        //     });
+        // }
+        return Ok(new Response
             {
                 statuscode = 400,
                 message = "User registration failed",
                 error_status = true,
                 data ="Hello"
             });
-        }
     }
 
 
