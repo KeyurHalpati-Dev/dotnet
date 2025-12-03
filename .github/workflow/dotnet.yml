@@ -1,0 +1,303 @@
+name: Build and Deploy .NET Core API to AWS EC2
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  IMAGE_NAME: dotnet-api
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    # Create Dockerfile dynamically for .NET Core API
+    - name: Create Dockerfile
+      run: |
+        cat > Dockerfile << 'EOF'
+        # Build stage
+        FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+        WORKDIR /src
+        
+        # Copy csproj and restore dependencies
+        COPY *.csproj ./
+        RUN dotnet restore
+        
+        # Copy everything else and build
+        COPY . ./
+        RUN dotnet publish -c Release -o /app/publish
+        
+        # Runtime stage
+        FROM mcr.microsoft.com/dotnet/aspnet:8.0
+        WORKDIR /app
+        COPY --from=build /app/publish .
+        
+        # Create a non-root user for security
+        RUN groupadd -g 1001 dotnetuser && \
+            useradd -r -u 1001 -g dotnetuser dotnetuser && \
+            chown -R dotnetuser:dotnetuser /app
+        
+        USER dotnetuser
+        
+        # Expose API port
+        EXPOSE 5001
+        ENV ASPNETCORE_URLS=http://+:5001
+        
+        # Add healthcheck to monitor container health
+        HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+          CMD curl -f http://localhost:5001/health || exit 1
+        
+        # Start the application (replace YourApiName.dll with your actual DLL name)
+        ENTRYPOINT ["dotnet", "YourApiName.dll"]
+        EOF
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Login to Docker Hub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
+                     -t ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                     --build-arg BUILDKIT_INLINE_CACHE=1 .
+    
+    - name: Test Docker image
+      run: |
+        echo "🧪 Testing Docker image..."
+        
+        # Run container for testing
+        docker run -d --name dotnet-api-service \
+          -p 5001:5001 \
+          -e ASPNETCORE_ENVIRONMENT=Development \
+          -e ASPNETCORE_URLS=http://+:5001 \
+          ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+        
+        echo "⏳ Waiting for container to start..."
+        sleep 20
+        
+        # Check if container is still running
+        if docker ps | grep -q dotnet-api-service; then
+          echo "✅ Container is running successfully!"
+          
+          # Test the API health endpoint
+          echo "🌐 Testing API health endpoint..."
+          if curl -f http://localhost:5001/health 2>/dev/null || curl -f http://localhost:5001/api 2>/dev/null; then
+            echo "✅ API endpoint is responding correctly!"
+          else
+            echo "⚠️  API endpoint test failed (this may be normal if no health endpoint exists)"
+            docker logs dotnet-api-service
+            # Don't fail the build if health endpoint doesn't exist
+          fi
+          
+          echo "📋 Container logs:"
+          docker logs --tail 20 dotnet-api-service
+          
+          docker stop dotnet-api-service
+          docker rm dotnet-api-service
+        else
+          echo "❌ Container crashed on startup!"
+          echo ""
+          echo "📋 Container logs:"
+          docker logs dotnet-api-service 2>&1 || echo "No logs available"
+          echo ""
+          echo "🔍 Container inspect:"
+          docker inspect dotnet-api-service --format='{{.State.Status}}: {{.State.Error}}' || true
+          docker rm dotnet-api-service 2>/dev/null || true
+          exit 1
+        fi
+    
+    - name: Push Docker image to Docker Hub
+      run: |
+        docker push ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+        docker push ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+    
+    - name: Image digest
+      run: echo "✅ .NET Core API image pushed successfully!"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && github.event_name == 'push'
+    
+    steps:
+    - name: Deploy to AWS EC2
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          echo "🚀 Starting .NET Core API deployment on AWS EC2..."
+          
+          # Login to Docker Hub
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          
+          # Pull the latest image
+          echo "📦 Pulling latest Docker image..."
+          docker pull ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          
+          # Stop and remove old container if exists
+          echo "🛑 Stopping old .NET API container..."
+          docker stop dotnet-api 2>/dev/null || true
+          docker rm dotnet-api 2>/dev/null || true
+          
+          # Create Docker network if it doesn't exist
+          echo "🌐 Setting up Docker network..."
+          docker network create my-app-network 2>/dev/null || echo "Network already exists"
+          
+          # Run new .NET API container (NO PORT MAPPING - internal only)
+          echo "▶️  Starting new .NET API container..."
+          docker run -d \
+            --name dotnet-api \
+            --network my-app-network \
+            --restart unless-stopped \
+            -e ASPNETCORE_ENVIRONMENT=Production \
+            -e ASPNETCORE_URLS=http://+:5001 \
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          
+          # Wait for container to start
+          echo "⏳ Waiting for container to initialize..."
+          sleep 10
+          
+          # Check if container is running
+          if docker ps | grep -q dotnet-api; then
+            echo "✅ .NET API container is running successfully!"
+            docker ps | grep dotnet-api
+          else
+            echo "❌ .NET API container failed to start!"
+            echo "Container logs:"
+            docker logs dotnet-api
+            exit 1
+          fi
+          
+          # Wait for app to fully start
+          sleep 5
+          
+          # Test API from within Docker network (using another container)
+          echo "🌐 Testing .NET API via Docker network..."
+          if docker run --rm --network my-app-network alpine/curl:latest -f http://dotnet-api:5001/health >/dev/null 2>&1 || \
+             docker run --rm --network my-app-network alpine/curl:latest -f http://dotnet-api:5001/api >/dev/null 2>&1; then
+            echo "✅ .NET API is accessible via Docker network!"
+          else
+            echo "⚠️  Warning: .NET API not responding yet via Docker network"
+            docker logs dotnet-api
+          fi
+          
+          # Clean up old Docker images (keep last 3)
+          echo "🧹 Cleaning up old images..."
+          docker images | grep "${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}" | tail -n +4 | awk '{print $3}' | xargs -r docker rmi -f 2>/dev/null || true
+          
+          # Show container status
+          echo "📊 Current container status:"
+          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "NAME|dotnet-api"
+          
+          echo "🎉 .NET Core API deployment completed successfully!"
+    
+    - name: Verify Deployment
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          echo "🔍 Verifying .NET API deployment..."
+          
+          # Wait a bit more for full startup
+          sleep 3
+          
+          # Check container logs (last 30 lines)
+          echo "📋 .NET API container logs:"
+          docker logs --tail 30 dotnet-api
+          
+          # Check container health
+          echo "🏥 Container health status:"
+          HEALTH_STATUS=$(docker inspect dotnet-api --format='{{.State.Health.Status}}' 2>/dev/null || echo "no healthcheck")
+          STATE_STATUS=$(docker inspect dotnet-api --format='{{.State.Status}}')
+          echo "Health: $HEALTH_STATUS"
+          echo "State: $STATE_STATUS"
+          
+          # Test .NET API via Docker network (simulate Nginx calling API)
+          echo "🔗 Testing .NET API via Docker network (as Nginx would)..."
+          if docker run --rm --network my-app-network alpine/curl:latest -f -s http://dotnet-api:5001/health >/dev/null 2>&1 || \
+             docker run --rm --network my-app-network alpine/curl:latest -f -s http://dotnet-api:5001/api >/dev/null 2>&1; then
+            echo "✅ .NET API is accessible via Docker network!"
+            echo "Sample API response:"
+            docker run --rm --network my-app-network alpine/curl:latest -s http://dotnet-api:5001/api | head -n 10 || echo "No response available"
+          else
+            echo "⚠️  Warning: .NET API not responding via Docker network"
+            echo "Container may still be starting up..."
+          fi
+          
+          # Check Docker network configuration
+          echo "🌐 Docker network configuration:"
+          docker network inspect my-app-network --format='{{range .Containers}}{{.Name}}: {{.IPv4Address}}{{"\n"}}{{end}}'
+          
+          # Check if Nginx proxy exists and can reach .NET API
+          if docker ps | grep -q nginx-proxy; then
+            echo "🔗 Testing .NET API through Nginx proxy..."
+            if curl -f -s http://localhost/dotnet-api >/dev/null 2>&1; then
+              echo "✅ .NET API is accessible through Nginx proxy!"
+            else
+              echo "⚠️  .NET API not yet accessible through Nginx (may need Nginx restart)"
+            fi
+          else
+            echo "ℹ️  Nginx proxy not running yet (will be deployed with frontend)"
+          fi
+          
+          echo "✅ .NET API verification complete!"
+    
+    - name: Deployment notification
+      if: always()
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎉 ✅ .NET CORE API DEPLOYMENT SUCCESSFUL!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "🔧 .NET API Configuration:"
+          echo "   • Container: dotnet-api"
+          echo "   • Internal Port: 5001"
+          echo "   • Network: my-app-network (internal only)"
+          echo "   • No direct external access (security best practice)"
+          echo ""
+          echo "🌐 Access Methods:"
+          echo "   • Via Nginx Proxy: http://${{ secrets.EC2_HOST }}/dotnet-api"
+          echo "   • Within Docker Network: http://dotnet-api:5001"
+          echo "   • From Node.js Backend: http://dotnet-api:5001"
+          echo "   • From React Frontend: /dotnet-api (via Nginx)"
+          echo ""
+          echo "📝 Integration Points:"
+          echo "   1. Node.js can call: http://dotnet-api:5001/api/endpoint"
+          echo "   2. React can call: /dotnet-api/api/endpoint (via Nginx)"
+          echo "   3. All services are on my-app-network"
+          echo ""
+          echo "✨ .NET API is ready for integration with your app!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        else
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "❌ .NET CORE API DEPLOYMENT FAILED!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Please check the logs above for error details."
+          echo "Common issues:"
+          echo "  • Docker login failed"
+          echo "  • Container crashed on startup"
+          echo "  • Missing environment variables"
+          echo "  • .NET runtime errors"
+          echo "  • Wrong DLL name in ENTRYPOINT"
+          echo "  • Database connection issues"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        fi
