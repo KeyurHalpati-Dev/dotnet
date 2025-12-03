@@ -54,7 +54,7 @@ public class UserController(IUserService service) : ControllerBase
         // }
     }
     
-    [HttpPost("RegisterUser")]
+    [HttpGet("RegisterUser")]
     public async Task<IActionResult> RegisterUser(UserRegisterModel user)
     {      
         // var result = await _userService.RegisterUser(user);
