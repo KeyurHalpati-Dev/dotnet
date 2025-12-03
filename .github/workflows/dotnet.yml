@@ -9,7 +9,7 @@ on:
       - '**/Controllers/**'
       - '**/Models/**'
       - '**/Services/**'
-      - '.github/workflows/dotnet-api.yml'
+      - '.github/workflows/dotnet.yml'
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:  # Manual trigger
