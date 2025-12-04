@@ -23,6 +23,7 @@ builder.Services.AddControllers()
 // This line is key
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddHealthChecks();
 
 // -----------------------------------------------------------
 // 4. (Optional) Store the connection string in a static holder
@@ -42,7 +43,7 @@ if (app.Environment.IsDevelopment())
 
 // app.UseHttpsRedirection(); 
 app.UseAuthorization();
-
 app.MapControllers();
+app.MapHealthChecks("/health");
 
 app.Run();
