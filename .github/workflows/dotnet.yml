@@ -58,7 +58,7 @@ jobs:
         ENV ASPNETCORE_ENVIRONMENT=Production
         
         # Start the application
-        ENTRYPOINT ["dotnet", "YourAppName.dll"]
+        ENTRYPOINT ["dotnet", "PMS.dll"]
         EOF
     
     - name: Set up Docker Buildx
