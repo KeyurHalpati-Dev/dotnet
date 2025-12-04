@@ -130,6 +130,14 @@ public class UserController(IUserService service) : ControllerBase
                 email = "david.brown@example.com",
                 age = 37,
                 city = "Phoenix"
+            },
+            new
+            {
+                id = 6,
+                name = "Admin",
+                email = "john.doe@example.com",
+                age = 28,
+                city = "New York"
             }
         };
 
