@@ -86,6 +86,55 @@ public class UserController(IUserService service) : ControllerBase
                 data ="Hello"
             });
     }
+     [HttpGet("StaticUser")]
+    public async Task<IActionResult> StaticUser()
+    {
+        var result =  new[]
+            {
+            new
+            {
+                id = 1,
+                name = "John Doe Holla",
+                email = "john.doe@example.com",
+                age = 28,
+                city = "New York"
+            },
+            new
+            {
+                id = 2,
+                name = "Jane Smith",
+                email = "jane.smith@example.com",
+                age = 34,
+                city = "Los Angeles"
+            },
+            new
+            {
+                id = 3,
+                name = "Mike Johnson",
+                email = "mike.johnson@example.com",
+                age = 42,
+                city = "Chicago"
+            },
+            new
+            {
+                id = 4,
+                name = "Sarah Williams",
+                email = "sarah.williams@example.com",
+                age = 29,
+                city = "Houston"
+            },
+            new
+            {
+                id = 5,
+                name = "David Brown",
+                email = "david.brown@example.com",
+                age = 37,
+                city = "Phoenix"
+            }
+        };
+
+        return Ok(await Task.FromResult(result));
+    }
 
 
 }

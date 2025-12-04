@@ -1,4 +1,4 @@
-name: Build and Deploy Frontend to AWS EC2
+name: Build and Deploy .NET Service to AWS EC2
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 env:
   DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  IMAGE_NAME: reactjs-app
+  IMAGE_NAME: dotnet-service
 
 jobs:
   build:
@@ -18,53 +18,47 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
     
-    # Create Dockerfile dynamically
+    # Create Dockerfile dynamically for .NET service
     - name: Create Dockerfile
       run: |
         cat > Dockerfile << 'EOF'
         # Build stage
-        FROM node:20-alpine AS builder
+        FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+        WORKDIR /src
         
+        # Copy csproj and restore dependencies
+        COPY *.csproj ./
+        RUN dotnet restore
+        
+        # Copy everything else and build
+        COPY . ./
+        RUN dotnet publish -c Release -o /app/publish
+        
+        # Runtime stage
+        FROM mcr.microsoft.com/dotnet/aspnet:8.0
         WORKDIR /app
         
-        # Copy package files
-        COPY package*.json ./
+        # Copy published app from build stage
+        COPY --from=build /app/publish .
         
-        # Install dependencies
-        RUN npm ci
-        
-        # Copy all files
-        COPY . .
-        
-        # Set build-time environment variable for API URL (relative path for Nginx proxy)
-        ARG VITE_API_URL=/api
-        ARG REACT_APP_API_URL=/api
-        ENV VITE_API_URL=$VITE_API_URL
-        ENV REACT_APP_API_URL=$REACT_APP_API_URL
-        
-        # Build the app
-        RUN npm run build
-        
-        # Production stage
-        FROM node:20-alpine
-        
-        WORKDIR /app
-        
-        # Install serve to run the build
-        RUN npm install -g serve
-        
-        # Copy build from builder stage
-        COPY --from=builder /app/dist ./dist
+        # Create non-root user
+        RUN groupadd -r dotnetuser && useradd -r -g dotnetuser dotnetuser
+        RUN chown -R dotnetuser:dotnetuser /app
+        USER dotnetuser
         
         # Expose port
-        EXPOSE 3000
+        EXPOSE 6000
         
         # Health check
-        HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-          CMD wget --no-verbose --tries=1 --spider http://localhost:3000 || exit 1
+        HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+          CMD curl -f http://localhost:6000/health || exit 1
         
-        # Start the app
-        CMD ["serve", "-s", "dist", "-l", "3000"]
+        # Set environment
+        ENV ASPNETCORE_URLS=http://+:6000
+        ENV ASPNETCORE_ENVIRONMENT=Production
+        
+        # Start the application
+        ENTRYPOINT ["dotnet", "YourAppName.dll"]
         EOF
     
     - name: Set up Docker Buildx
@@ -80,26 +74,49 @@ jobs:
       run: |
         docker build -t ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
                      -t ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-                     --build-arg VITE_API_URL=/api \
-                     --build-arg REACT_APP_API_URL=/api \
                      --build-arg BUILDKIT_INLINE_CACHE=1 .
     
     - name: Test Docker image
       run: |
-        docker run --rm -d --name reactjs-service \
-          -p 3000:3000 \
+        echo "🧪 Testing Docker image..."
+        
+        # Run container for testing
+        docker run -d --name dotnet-service \
+          -p 6000:6000 \
+          -e ASPNETCORE_ENVIRONMENT=Development \
           ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
         
-        sleep 10
+        echo "⏳ Waiting for container to start..."
+        sleep 15
         
-        # Check if container is running
-        docker ps | grep reactjs-service || exit 1
-        
-        # Test if app responds
-        curl -f http://localhost:3000 || exit 1
-        
-        # Stop test container
-        docker stop reactjs-service
+        # Check if container is still running
+        if docker ps | grep -q dotnet-service; then
+          echo "✅ Container is running successfully!"
+          
+          # Test the health endpoint
+          echo "🌐 Testing health endpoint..."
+          if curl -f http://localhost:6000/health; then
+            echo "✅ Health endpoint is responding correctly!"
+          else
+            echo "⚠️  Health endpoint test failed"
+            docker logs dotnet-service
+            docker stop dotnet-service
+            docker rm dotnet-service
+            exit 1
+          fi
+          
+          echo "📋 Container logs:"
+          docker logs --tail 20 dotnet-service
+          
+          docker stop dotnet-service
+          docker rm dotnet-service
+        else
+          echo "❌ Container crashed on startup!"
+          echo "📋 Container logs:"
+          docker logs dotnet-service 2>&1 || echo "No logs available"
+          docker rm dotnet-service 2>/dev/null || true
+          exit 1
+        fi
     
     - name: Push Docker image to Docker Hub
       run: |
@@ -107,7 +124,7 @@ jobs:
         docker push ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
     
     - name: Image digest
-      run: echo "✅ Frontend image pushed successfully!"
+      run: echo "✅ .NET service image pushed successfully!"
 
   deploy:
     needs: build
@@ -122,7 +139,7 @@ jobs:
         username: ${{ secrets.EC2_USERNAME }}
         key: ${{ secrets.EC2_SSH_KEY }}
         script: |
-          echo "🚀 Starting frontend deployment on AWS EC2..."
+          echo "🚀 Starting .NET service deployment on AWS EC2..."
           
           # Login to Docker Hub
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
@@ -132,209 +149,49 @@ jobs:
           docker pull ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
           
           # Stop and remove old container if exists
-          echo "🛑 Stopping old frontend container..."
-          docker stop reactjs-app 2>/dev/null || true
-          docker rm reactjs-app 2>/dev/null || true
+          echo "🛑 Stopping old .NET container..."
+          docker stop dotnet-service 2>/dev/null || true
+          docker rm dotnet-service 2>/dev/null || true
           
-          # Create Docker network if it doesn't exist
+          # Create Docker network if it doesn't exist (should already exist from other services)
           echo "🌐 Setting up Docker network..."
           docker network create my-app-network 2>/dev/null || echo "Network already exists"
           
-          # Run new frontend container (NO PORT MAPPING - internal only)
-          echo "▶️  Starting new frontend container..."
+          # Run new .NET service container (NO PORT MAPPING - internal only)
+          echo "▶️  Starting new .NET service container..."
           docker run -d \
-            --name reactjs-app \
+            --name dotnet-service \
             --network my-app-network \
             --restart unless-stopped \
-            -e VITE_API_URL=/api \
-            -e REACT_APP_API_URL=/api \
+            -e ASPNETCORE_ENVIRONMENT=Production \
+            -e ASPNETCORE_URLS=http://+:6000 \
             ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
           
           # Wait for container to start
-          sleep 5
+          echo "⏳ Waiting for container to initialize..."
+          sleep 10
           
           # Check if container is running
-          if docker ps | grep -q reactjs-app; then
-            echo "✅ Frontend container is running successfully!"
-            docker ps | grep reactjs-app
+          if docker ps | grep -q dotnet-service; then
+            echo "✅ .NET service container is running successfully!"
+            docker ps | grep dotnet-service
           else
-            echo "❌ Frontend container failed to start!"
+            echo "❌ .NET service container failed to start!"
             echo "Container logs:"
-            docker logs reactjs-app
+            docker logs dotnet-service
             exit 1
           fi
           
-          # Setup Nginx Reverse Proxy
-          echo "🌐 Setting up Nginx reverse proxy..."
-          
-          # Stop old nginx container
-          docker stop nginx-proxy 2>/dev/null || true
-          docker rm nginx-proxy 2>/dev/null || true
-          
-          # Remove any process using port 80
-          echo "🔍 Checking for processes on port 80..."
-          PID=$(ss -tlnp 2>/dev/null | grep ":80 " | awk '{print $6}' | sed 's/.*pid=//;s/,.*//' | head -1)
-          if [ ! -z "$PID" ]; then
-            echo "⚠️  Found process $PID using port 80, killing it..."
-            sudo kill -9 $PID 2>/dev/null || true
-            sleep 2
-          fi
-          
-          # CRITICAL FIX: Remove old nginx.conf if it exists (could be a directory)
-          echo "🧹 Cleaning up old nginx configuration..."
-          sudo rm -rf /tmp/nginx.conf 2>/dev/null || true
-          
-          # Create nginx configuration with CORRECT proxy_pass
-          echo "📝 Creating Nginx configuration..."
-          cat > /tmp/nginx.conf << 'NGINXEOF'
-          events {
-              worker_connections 1024;
-          }
-          
-          http {
-              # Enable gzip compression
-              gzip on;
-              gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
-              
-              upstream frontend {
-                  server reactjs-app:3000;
-              }
-              
-              upstream backend {
-                  server backend-app:5000;
-              }
-              
-              upstream dotnetapi {
-                  server dotnet-api:5001;
-              }
-              
-              server {
-                  listen 80;
-                  server_name _;
-                  
-                  # Security headers
-                  add_header X-Frame-Options "SAMEORIGIN" always;
-                  add_header X-Content-Type-Options "nosniff" always;
-                  add_header X-XSS-Protection "1; mode=block" always;
-                  
-                  # Frontend requests (React app)
-                  location / {
-                      proxy_pass http://frontend;
-                      proxy_http_version 1.1;
-                      proxy_set_header Upgrade $http_upgrade;
-                      proxy_set_header Connection 'upgrade';
-                      proxy_set_header Host $host;
-                      proxy_set_header X-Real-IP $remote_addr;
-                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                      proxy_set_header X-Forwarded-Proto $scheme;
-                      proxy_cache_bypass $http_upgrade;
-                      
-                      # Timeout settings
-                      proxy_connect_timeout 60s;
-                      proxy_send_timeout 60s;
-                      proxy_read_timeout 60s;
-                  }
-                  
-                  # .NET Core API requests
-                  location /dotnet-api/ {
-                      proxy_pass http://dotnetapi/;
-                      proxy_http_version 1.1;
-                      proxy_set_header Host $host;
-                      proxy_set_header X-Real-IP $remote_addr;
-                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                      proxy_set_header X-Forwarded-Proto $scheme;
-                      
-                      # CORS headers
-                      add_header Access-Control-Allow-Origin * always;
-                      add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
-                      add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
-                      
-                      # Handle preflight requests
-                      if ($request_method = OPTIONS) {
-                          return 204;
-                      }
-                      
-                      # Timeout settings
-                      proxy_connect_timeout 60s;
-                      proxy_send_timeout 60s;
-                      proxy_read_timeout 60s;
-                  }
-                  
-                  # Node.js Backend API requests
-                  location /api/ {
-                      proxy_pass http://backend/api/;
-                      proxy_http_version 1.1;
-                      proxy_set_header Host $host;
-                      proxy_set_header X-Real-IP $remote_addr;
-                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                      proxy_set_header X-Forwarded-Proto $scheme;
-                      
-                      # CORS headers
-                      add_header Access-Control-Allow-Origin * always;
-                      add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
-                      add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
-                      
-                      # Handle preflight requests
-                      if ($request_method = OPTIONS) {
-                          return 204;
-                      }
-                      
-                      # Timeout settings
-                      proxy_connect_timeout 60s;
-                      proxy_send_timeout 60s;
-                      proxy_read_timeout 60s;
-                  }
-                  
-                  # Health check endpoint
-                  location /health {
-                      access_log off;
-                      return 200 "healthy\n";
-                      add_header Content-Type text/plain;
-                  }
-              }
-          }
-          NGINXEOF
-          
-          # Verify the file was created correctly
-          if [ -f /tmp/nginx.conf ]; then
-            echo "✅ Nginx config file created successfully"
-            echo "📄 Config file size: $(wc -l < /tmp/nginx.conf) lines"
-          else
-            echo "❌ Failed to create nginx.conf"
-            exit 1
-          fi
-          
-          # Start Nginx container
-          echo "🚀 Starting Nginx reverse proxy..."
-          docker run -d \
-            --name nginx-proxy \
-            --network my-app-network \
-            -p 80:80 \
-            -v /tmp/nginx.conf:/etc/nginx/nginx.conf:ro \
-            --restart unless-stopped \
-            nginx:alpine
-          
-          # Wait for Nginx to start
+          # Wait for app to fully start
           sleep 5
           
-          # Check if Nginx is running
-          if docker ps | grep -q nginx-proxy; then
-            echo "✅ Nginx proxy is running successfully!"
-            docker ps | grep nginx-proxy
+          # Test .NET service from within Docker network
+          echo "🌐 Testing .NET service via Docker network..."
+          if docker run --rm --network my-app-network curlimages/curl:latest -f http://dotnet-service:6000/health >/dev/null 2>&1; then
+            echo "✅ .NET service is accessible via Docker network!"
           else
-            echo "❌ Nginx proxy failed to start!"
-            echo "📋 Nginx logs:"
-            docker logs nginx-proxy
-            exit 1
-          fi
-          
-          # Test Nginx configuration
-          echo "🔍 Testing Nginx configuration..."
-          if docker exec nginx-proxy nginx -t 2>&1 | grep -q "successful"; then
-            echo "✅ Nginx configuration is valid!"
-          else
-            echo "⚠️  Nginx configuration may have issues"
-            docker exec nginx-proxy nginx -t
+            echo "⚠️  Warning: .NET service not responding yet via Docker network"
+            docker logs dotnet-service
           fi
           
           # Clean up old Docker images (keep last 3)
@@ -345,7 +202,7 @@ jobs:
           echo "📊 Current running containers:"
           docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
           
-          echo "🎉 Frontend deployment completed successfully!"
+          echo "🎉 .NET service deployment completed successfully!"
     
     - name: Verify Deployment
       uses: appleboy/ssh-action@v1.0.0
@@ -354,103 +211,78 @@ jobs:
         username: ${{ secrets.EC2_USERNAME }}
         key: ${{ secrets.EC2_SSH_KEY }}
         script: |
-          echo "🔍 Verifying frontend deployment..."
+          echo "🔍 Verifying .NET service deployment..."
           
-          # Wait a bit more for services to fully start
-          sleep 5
+          # Wait a bit more for full startup
+          sleep 3
           
-          # Check frontend container logs
-          echo "📋 Frontend container logs (last 20 lines):"
-          docker logs --tail 20 reactjs-app
-          
-          # Check Nginx logs
-          echo "📋 Nginx proxy logs (last 20 lines):"
-          docker logs --tail 20 nginx-proxy
+          # Check container logs
+          echo "📋 .NET service container logs:"
+          docker logs --tail 30 dotnet-service
           
           # Check container health
           echo "🏥 Container health status:"
-          echo "Frontend: $(docker inspect reactjs-app --format='{{.State.Status}}')"
-          echo "Nginx: $(docker inspect nginx-proxy --format='{{.State.Status}}')"
-          echo "Backend: $(docker inspect backend-app --format='{{.State.Status}}' 2>/dev/null || echo 'Not running')"
+          HEALTH_STATUS=$(docker inspect dotnet-service --format='{{.State.Health.Status}}' 2>/dev/null || echo "no healthcheck")
+          STATE_STATUS=$(docker inspect dotnet-service --format='{{.State.Status}}')
+          echo "Health: $HEALTH_STATUS"
+          echo "State: $STATE_STATUS"
           
-          # Test if Nginx is responding on port 80
-          echo "🌐 Testing Nginx on port 80..."
-          if curl -f http://localhost:80 >/dev/null 2>&1; then
-            echo "✅ Nginx is responding successfully!"
+          # Test .NET service via Docker network (simulate backend calling it)
+          echo "🔗 Testing .NET service via Docker network (as Node.js backend would)..."
+          if docker run --rm --network my-app-network curlimages/curl:latest -f -s http://dotnet-service:6000/health >/dev/null 2>&1; then
+            echo "✅ .NET service is accessible via Docker network!"
+            echo "Sample health response:"
+            docker run --rm --network my-app-network curlimages/curl:latest -s http://dotnet-service:6000/health
           else
-            echo "❌ Nginx is not responding!"
-            exit 1
+            echo "⚠️  Warning: .NET service not responding via Docker network"
+            echo "Container may still be starting up..."
           fi
           
-          # Test frontend through Nginx
-          echo "🌐 Testing frontend through Nginx..."
-          if curl -f http://localhost/ >/dev/null 2>&1; then
-            echo "✅ Frontend is accessible through Nginx!"
-            echo "Sample response (first 200 chars):"
-            curl -s http://localhost/ | head -c 200
-            echo ""
-          else
-            echo "⚠️  Warning: Frontend not responding through Nginx"
-          fi
-          
-          # Test backend API through Nginx
-          echo "🔗 Testing backend API through Nginx..."
-          if curl -f http://localhost/api/users >/dev/null 2>&1; then
-            echo "✅ Backend API is accessible through Nginx!"
-            echo "Sample response:"
-            curl -s http://localhost/api/users | head -c 200
-            echo ""
-          else
-            echo "⚠️  Warning: Backend API not responding (make sure backend is deployed)"
-          fi
-          
-          # Test internal Docker network connectivity
-          echo "🔗 Testing Docker network connectivity..."
-          if docker run --rm --network my-app-network alpine/curl:latest -f http://reactjs-app:3000 >/dev/null 2>&1; then
-            echo "✅ Frontend is accessible via Docker network!"
-          else
-            echo "⚠️  Warning: Cannot reach frontend via Docker network"
-          fi
-          
-          # Show network information
-          echo "🌐 Docker network information:"
+          # Check Docker network configuration
+          echo "🌐 Docker network configuration:"
           docker network inspect my-app-network --format='{{range .Containers}}{{.Name}}: {{.IPv4Address}}{{"\n"}}{{end}}'
           
-          echo "✅ Verification complete!"
+          # Test from Node.js backend container if it exists
+          if docker ps | grep -q backend-app; then
+            echo "🔗 Testing connection from Node.js backend to .NET service..."
+            docker exec backend-app sh -c "curl -f http://dotnet-service:6000/health" 2>/dev/null && \
+              echo "✅ Node.js backend can reach .NET service!" || \
+              echo "⚠️  Node.js backend cannot reach .NET service yet"
+          fi
+          
+          echo "✅ .NET service verification complete!"
     
     - name: Deployment notification
       if: always()
       run: |
         if [ "${{ job.status }}" == "success" ]; then
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🎉 ✅ DEPLOYMENT SUCCESSFUL!"
+          echo "🎉 ✅ .NET SERVICE DEPLOYMENT SUCCESSFUL!"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-          echo "🌍 Your application is now live at:"
-          echo "   👉 http://${{ secrets.EC2_HOST }}"
+          echo "🔧 .NET Service Configuration:"
+          echo "   • Container: dotnet-service"
+          echo "   • Internal Port: 6000"
+          echo "   • Network: my-app-network (internal only)"
+          echo "   • No direct external access (security best practice)"
           echo ""
-          echo "📡 API endpoint:"
-          echo "   👉 http://${{ secrets.EC2_HOST }}/api"
+          echo "🌐 Access Methods:"
+          echo "   • From Node.js Backend: http://dotnet-service:6000"
+          echo "   • From any container in my-app-network"
           echo ""
-          echo "🔧 Architecture:"
-          echo "   • Nginx Proxy (Port 80) → Handles all incoming traffic"
-          echo "   • Frontend (reactjs-app:3000) → Internal Docker network"
-          echo "   • Backend (backend-app:5000) → Internal Docker network"
+          echo "📝 Integration with Node.js Backend:"
+          echo "   In your Node.js code, call the .NET service using:"
+          echo "   const response = await axios.get('http://dotnet-service:6000/api/endpoint');"
           echo ""
-          echo "✨ All services are communicating via Docker network!"
+          echo "✨ All services are now interconnected!"
+          echo "   Frontend ← Nginx → Backend → .NET Service"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         else
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "❌ DEPLOYMENT FAILED!"
+          echo "❌ .NET SERVICE DEPLOYMENT FAILED!"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           echo "Please check the logs above for error details."
-          echo "Common issues:"
-          echo "  • Docker login failed"
-          echo "  • Port 80 already in use"
-          echo "  • Backend container not running"
-          echo "  • Network connectivity issues"
-          echo "  • nginx.conf file creation failed"
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         fi
